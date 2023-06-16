@@ -116,17 +116,20 @@ class ViTForFeatureExtraction(Module):
 class ViTForImageReconstruction(Module):
     def __init__(self, d_embed, n_layers, n_head, dropout, img_size, patch_size):
         super().__init__()
-        seq_length = (img_size // patch_size)**2
+        self.seq_length = (img_size // patch_size)**2
         self.patch_embed = PatchEmbedding(img_size, patch_size, d_embed)
-        self.pos_embed = Embedding(seq_length, d_embed)
+        self.pos_embed = Embedding(self.seq_length, d_embed)
         self.dropout = Dropout(dropout)
         self.blocks = ModuleList([Block(d_embed, n_head, dropout) for _ in range(n_layers)])
         self.norm = RMSNorm(d_embed)
         self.unflatten = nn.Unflatten(2, (img_size // patch_size, img_size // patch_size))
         self.head = nn.ConvTranspose2d(d_embed, 3, kernel_size=patch_size, stride=patch_size)
-        
-    def forward(self, x):
+        self.mask_embed = nn.Embedding(1, d_embed)
+
+    def forward(self, x, mask=None):
         x = self.patch_embed(x)
+        if mask is not None:
+            x = x * ~mask.unsqueeze(-1) + self.mask_embed.weight * mask.unsqueeze(-1)
         pos = torch.arange(0, x.shape[1], dtype=torch.long).unsqueeze(0)
         x = x + self.pos_embed(pos)
         x = self.dropout(x)
@@ -138,7 +141,7 @@ class ViTForImageReconstruction(Module):
         x = x.transpose(2, 1)
         x = self.unflatten(x)
         x = self.head(x)
-        return F.sigmoid(x)
+        return F.sigmoid(x) # make sure values are normalized between 0 and 1 for RGB
 
 if __name__ == "__main__":
     import os
@@ -166,7 +169,7 @@ if __name__ == "__main__":
     to_tensor = transforms.ToTensor()
     to_image = transforms.ToPILImage()
 
-    train_size = 0.8
+    train_size = 0.9
     split_index = int(len(images) * train_size)
 
     train_images = images[:split_index]
@@ -180,44 +183,107 @@ if __name__ == "__main__":
     loss_fn = L1Loss()
 
     batch_size = 64
-    n_epochs = 20
+    n_epochs = 100
+    mask_prob = 0.7
 
     train_losses = []
     eval_losses = []
+
+    total_iter = 0
 
     for n in range(n_epochs):
         random.shuffle(train_images)
         random.shuffle(eval_images)
         for i in range(0, len(train_images)-batch_size, batch_size):
             optimizer.zero_grad()
-            
             batch = torch.stack([to_tensor(image) for image in train_images[i : i + batch_size]]).cuda()
-            outputs = model(batch)
+            random_tensor = torch.rand(batch_size, model.seq_length)
+            mask = random_tensor < mask_prob
+            outputs = model(batch, mask)
+            # masked_outputs = outputs[mask]
+            # masked_batch = batch[mask]
             loss = loss_fn(outputs, batch)
             print(f"Epoch {n}: Train loss for batch {i // batch_size}/{len(train_images)//batch_size}: {loss.item()}")
             loss.backward()
             optimizer.step()
 
             if (i // batch_size) % 10 == 0:
-                image = to_tensor(eval_images[0]).unsqueeze(0).cuda()
-                output = model(image)
-                image = to_image(output[0])
-                image.save(f"output-{n}-{i // batch_size}.png")
+                image = to_tensor(eval_images[0]).unsqueeze(0).cuda()  # original image
+                random_tensor = torch.rand(1, model.seq_length)
+                mask = random_tensor < mask_prob
+                with torch.no_grad():
+                    output = model(image, mask)
+
+                output_image = to_image(output.cpu()[0])
+
+                # construct pixel_mask using mask
+                pixel_mask = torch.ones((3, 250, 250))  # 3 channel, same height and width as your images
+                for idx, val in enumerate(mask[0]):
+                    if val.item():
+                        row = (idx // 10) * 25
+                        col = (idx % 10) * 25
+                        pixel_mask[:, row: row + 25, col: col + 25] = 0
+
+                # mask is in range [0, 1], we need to convert it to [0, 255] for PIL
+                pixel_mask = pixel_mask.mul(255).byte()
+                pixel_mask_image = to_image(pixel_mask)
+
+                # load original image
+                original_image = to_image(image.cpu()[0])
+
+                # Composite the original image with the mask
+                composite_image = Image.composite(original_image, pixel_mask_image, pixel_mask_image.convert('L'))
+
+                # create a new image big enough to hold the original, masked, and output images side by side
+                combined_image = Image.new('RGB', (output_image.width * 3, output_image.height))
+
+                # paste the images into the combined image
+                combined_image.paste(to_image(eval_images[0]), (0, 0))
+                combined_image.paste(composite_image, (output_image.width, 0))
+                combined_image.paste(output_image, (output_image.width * 2, 0))
+
+                combined_image.save(f"output-{str(total_iter).zfill(5)}.png")
+                # image = to_tensor(eval_images[0]).unsqueeze(0).cuda()
+                # random_tensor = torch.rand(1, model.seq_length)
+                # mask = random_tensor < mask_prob
+                # with torch.no_grad():
+                #     output = model(image, mask)
+                # image = to_image(output[0])
+
+                # pixel_mask = torch.ones(250, 250)
+
+                # print(mask)
+
+                # for i, val in enumerate(mask[0]):
+                #     if val.item():
+                #         row = (i % 10) * 25
+                #         col = (i // 10) *25
+                #         pixel_mask[row : row + 25, col : col + 25] = 0
+
+                # pixel_mask = to_image(pixel_mask)
+
+                # pixel_mask.save(f"output-{str(total_iter).zfill(5)}.png")
 
             if (i // batch_size) % 50 == 0:
                 train_losses.append(loss.item())
                 losses = []
                 for i in range(0, len(eval_images)-batch_size, batch_size):
                     batch = torch.stack([to_tensor(image) for image in eval_images[i : i + batch_size]]).cuda()
+                    random_tensor = torch.rand(batch_size, model.seq_length)
+                    mask = random_tensor < mask_prob
                     with torch.no_grad():
-                        outputs = model(batch)
+                        outputs = model(batch, mask)
+                    # masked_outputs = outputs[mask]
+                    # masked_batch = batch[mask]
                     loss = loss_fn(outputs, batch)
                     print(f"Epoch {n}: Eval loss for batch {i // batch_size}/{len(eval_images)// batch_size}: {loss.item()}")
                     losses.append(loss.item())
                 mean_loss = sum(losses)/len(losses)
                 print(f"Epoch {n}: Mean eval loss for batch {i // batch_size}/{len(eval_images)// batch_size}: {mean_loss}")
                 eval_losses.append(mean_loss)
-
+            
+            total_iter += 1
+        torch.save(model.state_dict(), "image_reconstruction_transformer_masked_2.pt")
 
     plt.plot(train_losses, label="train loss")
     plt.plot(eval_losses, label="eval loss")
@@ -225,5 +291,3 @@ if __name__ == "__main__":
     plt.ylabel("loss")
     plt.yscale("log")
     plt.show()
-
-    torch.save(model.state_dict(), "image_reconstruction_transformer.pt")
